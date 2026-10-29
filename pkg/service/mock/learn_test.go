@@ -3,6 +3,7 @@ package mock
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -221,6 +222,62 @@ func TestARoundsEndKeepsWhatWasLearnedOnlyFromAClientTestsReader(t *testing.T) {
 			}
 			if logs.FilterMessageSnippet("keploy kept nothing its agent learned").Len() != 1 {
 				t.Fatalf("logs %v; want the round to say it kept nothing", logs.All())
+			}
+		})
+	}
+}
+
+// settleInstr is outcomeInstr with the agent's end-of-run hook (RunSettler),
+// which records each call in order and fails when told to.
+type settleInstr struct {
+	outcomeInstr
+	calls *[]string
+	err   error
+}
+
+func (s settleInstr) AfterTestRun(_ context.Context, _ string, sets []string, _ models.TestCoverage) error {
+	*s.calls = append(*s.calls, "AfterTestRun "+strings.Join(sets, ","))
+	return s.err
+}
+
+func (s settleInstr) GetConsumedMocks(ctx context.Context) ([]models.MockState, error) {
+	*s.calls = append(*s.calls, "GetConsumedMocks")
+	return s.outcomeInstr.GetConsumedMocks(ctx)
+}
+
+// Under the proven switch the replay's end calls the agent's end-of-run hook
+// (AfterTestRun) once the test command has exited, before it reads what the
+// agent served: the agent finishes what it still does for the run's tests
+// first, as the row of a process the last test reached that an enterprise
+// agent judges after the test's end. A hook that fails leaves what was
+// served unread, so no test is judged on it. Without the switch it is not
+// called, as before.
+func TestTheReplaysEndSettlesTheAgentBeforeItReadsTheOutcome(t *testing.T) {
+	for _, c := range []struct {
+		proven bool
+		err    error
+		want   []string
+	}{
+		{false, nil, []string{"GetConsumedMocks"}},
+		{true, nil, []string{"AfterTestRun s", "GetConsumedMocks"}},
+		{true, errors.New("agent gone"), []string{"AfterTestRun s"}},
+	} {
+		t.Run(fmt.Sprintf("proven=%v err=%v", c.proven, c.err), func(t *testing.T) {
+			sw := ""
+			if c.proven {
+				sw = "1"
+			}
+			t.Setenv(provenswitch.Env, sw)
+			var calls []string
+			cfg := &config.Config{}
+			cfg.Mock.Name = "s"
+			m := &mockService{config: cfg, mockDB: &learnedStore{}, logger: zap.NewNop(), instrumentation: settleInstr{outcomeInstr: outcomeInstr{consumed: []models.MockState{{Name: "mock-0"}}}, calls: &calls, err: c.err}}
+			counts := m.reportOutcome(context.Background(), 1, replayDetail{set: "s"}, func() bool { return false })
+			if !reflect.DeepEqual(calls, c.want) {
+				t.Fatalf("calls %v, want %v", calls, c.want)
+			}
+			if want := map[bool]int{true: -1, false: 1}[c.err != nil]; counts.consumed != want {
+				t.Fatalf("consumed %d, want %d", counts.consumed, want)
 			}
 		})
 	}

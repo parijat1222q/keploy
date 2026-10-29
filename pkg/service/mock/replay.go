@@ -1863,6 +1863,26 @@ type replayCounts struct {
 	uncharged []UnchargedMiss
 }
 
+// settleRun, under the proven switch, calls the agent's AfterTestRun
+// (RunSettler), the hook keploy test's replay calls once its last test set
+// ends, once the test command has exited and before the run's outcome is
+// read: the agent then finishes what it still does for the run's tests, as
+// an enterprise agent writes the row of each process of the run it saw off
+// the run's clock, the last test's among them, which its verdict reads next.
+// Its error leaves the outcome unread: a verdict on it would rest on rows the
+// agent had not finished. Without the switch, or an agent client without the
+// hook, it does nothing, as before.
+func (m *mockService) settleRun(ctx context.Context) error {
+	s, ok := m.instrumentation.(RunSettler)
+	if !ok || !provenswitch.On() {
+		return nil
+	}
+	if err := s.AfterTestRun(ctx, "", []string{m.setName()}, models.TestCoverage{}); err != nil {
+		return fmt.Errorf("keploy's agent did not finish checking the run's tests: %w", err)
+	}
+	return nil
+}
+
 // reportOutcome logs which mocks were consumed and which outgoing calls matched
 // nothing. It returns the consumed and missed counts, each -1 when its read
 // failed; whether the MISSES specifically were readable is the only half
@@ -1900,7 +1920,12 @@ func (m *mockService) reportOutcome(ctx context.Context, loaded int, detail repl
 			"waiting for keploy's agent to report what it served and missed",
 			replayDrainWords.stopNow,
 			func(outcomeCtx context.Context) error {
-				consumed, consumedErr = m.instrumentation.GetConsumedMocks(outcomeCtx)
+				// The agent first finishes what it still does for the run's
+				// tests (settleRun); unfinished, what it served is not read,
+				// so no test is judged on it.
+				if consumedErr = m.settleRun(outcomeCtx); consumedErr == nil {
+					consumed, consumedErr = m.instrumentation.GetConsumedMocks(outcomeCtx)
+				}
 				misses, missesErr = m.instrumentation.GetMockErrors(outcomeCtx)
 				if reader, ok := m.instrumentation.(idPairReader); ok {
 					if pairs, err := reader.GetIDPairs(outcomeCtx); err == nil {
