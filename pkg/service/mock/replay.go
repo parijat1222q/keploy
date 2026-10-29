@@ -551,7 +551,10 @@ func (m *mockService) Replay(ctx context.Context) (err error) {
 	// The learn step's findings not kept means keploy did not complete the
 	// round, whatever the test command did: that is the exit, and the
 	// receipt's.
-	if counts.learnErr != nil && appErr.AppErrorType != models.ErrInternal {
+	// A learn step that could not read what the agent served because the
+	// agent did not finish its end of the run (settleErr) is that failure,
+	// named as it is below, the test command's exit kept.
+	if counts.learnErr != nil && counts.settleErr == nil && appErr.AppErrorType != models.ErrInternal {
 		utils.LogError(m.logger, counts.learnErr, "keploy did not complete this round of the record")
 		appErr = models.AppError{AppErrorType: models.ErrInternal, Err: counts.learnErr}
 	}
@@ -574,11 +577,27 @@ func (m *mockService) Replay(ctx context.Context) (err error) {
 		// that passed.
 		runnerExit, failedBy = -1, FailedByKeploy
 	}
-	// What the run compares is short of requests the agent captured: keploy
-	// did not complete it, whatever the test command did (its exit is kept),
-	// and a verdict on part of it is not one on the run.
-	requestsOnly := requestsShort != "" && failedBy != FailedByKeploy
-	if requestsOnly {
+	// What the run compares is short of requests the agent captured, or,
+	// under the proven switch, the agent did not finish checking the run's
+	// tests (settleRun: its end-of-run hook refused, or the agent was gone),
+	// as when it could not write the row of a program it saw off the run's
+	// clock: keploy did not complete the run, whatever the test command did
+	// (its exit is kept), and a verdict on part of it is not one on the run.
+	// A failure keploy already named keeps its name; the user's interrupt is
+	// no agent failure, and the run ends unjudged on it (below).
+	incomplete := requestsShort
+	if counts.settleErr != nil && failedBy != FailedByKeploy && parent.Err() == nil {
+		m.logger.Error("replay failed: keploy's agent did not finish checking the run's tests, so they are not judged ("+provenswitch.Env+"=1)",
+			zap.String("mock-set", name), zap.Error(counts.settleErr),
+			zap.String("next_step", "check the agent logs for why its end-of-run hook failed, then replay again"))
+		utils.SetExitCodeOnce(utils.ExitKeployError)
+		if incomplete != "" {
+			incomplete += "; "
+		}
+		incomplete += counts.settleErr.Error()
+	}
+	incompleteOnly := incomplete != "" && failedBy != FailedByKeploy
+	if incompleteOnly {
 		failedBy = FailedByKeploy
 	}
 	// A process the agent could not track -- the kernel refused it a place in
@@ -773,9 +792,9 @@ func (m *mockService) Replay(ctx context.Context) (err error) {
 		isolated, isolationNote = false, captureUnverified
 	}
 	var keployErr string
-	if failedBy == FailedByKeploy && requestsOnly {
-		isolated, isolationNote = false, "keploy did not complete the run: "+requestsShort
-		keployFailure, keployErr = errors.New(isolationNote), requestsShort
+	if failedBy == FailedByKeploy && incompleteOnly {
+		isolated, isolationNote = false, "keploy did not complete the run: "+incomplete
+		keployFailure, keployErr = errors.New(isolationNote), incomplete
 	} else if failedBy == FailedByKeploy {
 		isolated, isolationNote = false, "keploy did not complete the run: "+string(appErr.AppErrorType)
 		keployFailure = errors.New(isolationNote)
@@ -1861,6 +1880,9 @@ type replayCounts struct {
 	// that no test was charged with (Receipt.UnchargedMisses); nil when the
 	// misses were not read.
 	uncharged []UnchargedMiss
+	// settleErr is why the agent's end-of-run hook failed (settleRun): the
+	// run did not complete, and what it served was not read.
+	settleErr error
 }
 
 // settleRun, under the proven switch, calls the agent's AfterTestRun
@@ -1878,6 +1900,11 @@ func (m *mockService) settleRun(ctx context.Context) error {
 		return nil
 	}
 	if err := s.AfterTestRun(ctx, "", []string{m.setName()}, models.TestCoverage{}); err != nil {
+		// The run's own cancel (the agent died, and the run's group gave up
+		// on it) says why the call ended; its error says only "canceled".
+		if cause := context.Cause(ctx); cause != nil && !errors.Is(err, cause) {
+			err = fmt.Errorf("%w (%v)", err, cause)
+		}
 		return fmt.Errorf("keploy's agent did not finish checking the run's tests: %w", err)
 	}
 	return nil
@@ -1896,7 +1923,7 @@ func (m *mockService) settleRun(ctx context.Context) error {
 func (m *mockService) reportOutcome(ctx context.Context, loaded int, detail replayDetail, stopped func() bool) replayCounts {
 	var consumed []models.MockState
 	var misses []models.UnmatchedCall
-	var consumedErr, missesErr error
+	var consumedErr, missesErr, settleErr error
 	// Under docker compose the runner exiting is what stops the whole project,
 	// the agent service included, so by now there is no agent left to ask. It
 	// says what it served and missed as it is stopped, and that account is
@@ -1923,7 +1950,8 @@ func (m *mockService) reportOutcome(ctx context.Context, loaded int, detail repl
 				// The agent first finishes what it still does for the run's
 				// tests (settleRun); unfinished, what it served is not read,
 				// so no test is judged on it.
-				if consumedErr = m.settleRun(outcomeCtx); consumedErr == nil {
+				settleErr = m.settleRun(outcomeCtx)
+				if consumedErr = settleErr; consumedErr == nil {
 					consumed, consumedErr = m.instrumentation.GetConsumedMocks(outcomeCtx)
 				}
 				misses, missesErr = m.instrumentation.GetMockErrors(outcomeCtx)
@@ -2079,6 +2107,7 @@ func (m *mockService) reportOutcome(ctx context.Context, loaded int, detail repl
 	}
 	counts.learnedPool = learnedPool
 	counts.learnErr = learnErr
+	counts.settleErr = settleErr
 	return counts
 }
 
