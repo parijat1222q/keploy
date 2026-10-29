@@ -350,16 +350,33 @@ func TestMatchCommand_TheRecordedPrepEntriesLineHoldsNoSQLLiteral(t *testing.T) 
 // The schema-noise lines name a drifted field by its shape (models.FieldShapes):
 // a JSON key in a SEND_LONG_DATA chunk is the application's (an account ID
 // here) and is written {}, and no stretch of the key or of either side's
-// value appears in the log in any encoding. A command's own places (an
+// value appears in the log in any encoding; so is a query attribute's name
+// that may be a value. A command's own places (an
 // EXECUTE's parameters.0.value, a statement's query.literals.0) are positions
 // keploy counts: they are kept whole, so the line names the field as the
 // user marks it as noise. Both the learn (detection) and the strict
 // rejection logged the paths raw. (A chunk's drift is learned on a line of
 // its own that names no field.)
 func TestMatchCommand_TheSchemaNoiseLinesNameDriftedFieldsByTheirShape(t *testing.T) {
-	const acct, recTok, liveTok = "acct_7Hq2Lz9Xw4Pm", "sk_rec_Mm3Pq8Zt", "sk_live_Q7wZr9Kf"
+	const acct, acctAttr, recTok, liveTok = "acct_7Hq2Lz9Xw4Pm", "acct_9wq4lz7xh2km", "sk_rec_Mm3Pq8Zt", "sk_live_Q7wZr9Kf"
 	chunk := func(tok string) []byte { return []byte(`{"` + acct + `":"` + tok + `","pad":"x"}`) }
 	tokenQuery := func(tok string) string { return "SELECT id FROM sessions WHERE token = '" + tok + "'" }
+	// A query attribute the statement reads, by a name that may be a value
+	// (the app's account ID): the body keys it by that name.
+	const readsAcct = "SELECT mysql_query_attribute_string('" + acctAttr + "') AS v"
+	attr := func(tok string) []mysql.Parameter {
+		return []mysql.Parameter{{Type: uint16(mysql.FieldTypeString), Name: acctAttr, Value: tok}}
+	}
+	attrMock := func(tok string) *models.Mock {
+		m := readbackMock("q1", readsAcct, "row", zeroTime())
+		m.Spec.MySQLRequests[0].PacketBundle.Message.(*mysql.QueryPacket).Parameters = attr(tok)
+		return m
+	}
+	attrReq := func(tok string) mysql.Request {
+		req := comQueryReq(readsAcct)
+		req.PacketBundle.Message.(*mysql.QueryPacket).Parameters = attr(tok)
+		return req
+	}
 	const learned = "schema-noise detection: learned request-body drift on matched mock"
 	const rejected = "schema-noise strict: rejected candidate mock (non-noise request field drifted)"
 	for _, c := range []struct {
@@ -370,6 +387,7 @@ func TestMatchCommand_TheSchemaNoiseLinesNameDriftedFieldsByTheirShape(t *testin
 		want              []string
 	}{
 		{"a learned literal", learned, "fields", true, false, readbackMock("q1", tokenQuery(recTok), "row", zeroTime()), comQueryReq(tokenQuery(liveTok)), []string{"body.query.literals.0"}},
+		{"a learned attribute", learned, "fields", true, false, attrMock(recTok), attrReq(liveTok), []string{"body.attributes.{}.value"}},
 		{"a rejected chunk key", rejected, "drifted_fields", false, true, sldMockOf("sld1", chunk(recTok)), sldReq(chunk(liveTok)), []string{"body.data.{}"}},
 		{"a learned parameter", learned, "fields", true, false, execMock("m1", recTok), mysql.Request{PacketBundle: execBundle(liveTok)}, []string{"body.parameters.0.value"}},
 		{"a rejected parameter", rejected, "drifted_fields", false, true, execMock("m1", recTok), mysql.Request{PacketBundle: execBundle(liveTok)}, []string{"body.parameters.0.value"}},
@@ -391,7 +409,7 @@ func TestMatchCommand_TheSchemaNoiseLinesNameDriftedFieldsByTheirShape(t *testin
 			if !strings.Contains(log, c.line) {
 				t.Fatalf("the rendered log is not the one checked: %s", log)
 			}
-			for what, content := range map[string]string{"the chunk's key": acct, "the recorded value": recTok, "the live value": liveTok} {
+			for what, content := range map[string]string{"the chunk's key": acct, "the attribute's name": acctAttr, "the recorded value": recTok, "the live value": liveTok} {
 				if found := logleak.Find(log, []byte(content)); len(found) > 0 {
 					t.Errorf("the log holds %s: %v", what, found)
 				}
