@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -20,12 +21,14 @@ import (
 	"time"
 
 	"go.keploy.io/server/v3/pkg"
+	"go.keploy.io/server/v3/pkg/agent/logleak"
 	"go.keploy.io/server/v3/pkg/agent/memoryguard"
 	syncMock "go.keploy.io/server/v3/pkg/agent/proxy/syncMock"
 	"go.keploy.io/server/v3/pkg/models"
 	"go.keploy.io/server/v3/pkg/platform/yaml"
 	"go.keploy.io/server/v3/pkg/platform/yaml/testdb"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 	yamlLib "gopkg.in/yaml.v3"
 )
@@ -628,5 +631,92 @@ func TestSkipGRPCUnderPressureDecidesByThePauseAsTheRequestWasRead(t *testing.T)
 	}
 	if got := mgr.NotRecordedUnderPressure(); got.Total != 3 || got.ByConn["10.0.0.1:5000 -> 127.0.0.1:50051"] != 3 {
 		t.Fatalf("not recorded under pressure: %+v, want the three calls left out, on their connection", got)
+	}
+}
+
+// failingBody yields data, then fails with err: a request body the client
+// stopped sending partway through.
+type failingBody struct {
+	data []byte
+	err  error
+}
+
+func (b *failingBody) Read(p []byte) (int, error) {
+	if len(b.data) == 0 {
+		return 0, b.err
+	}
+	n := copy(p, b.data)
+	b.data = b.data[n:]
+	return n, nil
+}
+
+func (b *failingBody) Close() error { return nil }
+
+// Capture's log lines name a request by its method, host, path and query
+// parameter names, and a body by its length and content type: no stretch of
+// a body or of a query value appears in the debug log in any encoding. A
+// body that failed partway through its read was logged whole, as base64, and
+// a request over a size limit by its URL whole, query values and all. The
+// log is rendered as production renders it, JSON and console.
+func TestCapture_LogsNoBodyAndNoQueryValue(t *testing.T) {
+	const token, email = "sk_live_9fQ2xLp7Rw", "ada.lovelace@example.com"
+	target := "http://localhost:8080/pay?token=" + token + "&email=" + url.QueryEscape(email)
+	reqBody := append([]byte("card=4111111111111111&cvv=737&holder=Ada+Lovelace"), 0x00, 0xff, 0x10, 0x80, 0xfe, 0x7f, 0xc3, 0x28, 0x1b, 0x9d)
+	respUnit := []byte(`{"balance":"98765.43","iban":"DE89370400440532013000"}`)
+	planted := map[string][]byte{"the token": []byte(token), "the e-mail": []byte(email), "the request body": reqBody, "the response body": respUnit}
+
+	for _, c := range []struct {
+		name, msg string
+		req       func() io.ReadCloser
+		resp      []byte
+		level     zapcore.Level
+	}{
+		{"a body that fails partway", "failed to read the http request body",
+			func() io.ReadCloser {
+				return &failingBody{data: append([]byte(nil), reqBody...), err: errors.New("client reset the connection")}
+			}, respUnit, zapcore.DebugLevel},
+		{"a response over 1 MB", "response body exceeds 1MB during recording, storing only body size",
+			func() io.ReadCloser { return io.NopCloser(bytes.NewReader(reqBody)) },
+			bytes.Repeat(respUnit, LargeBodyThreshold/len(respUnit)+1), zapcore.DebugLevel},
+		{"a test case over 5 MB", "HTTP test case data exceeds 5MB limit, skipping capture",
+			func() io.ReadCloser { return io.NopCloser(bytes.NewReader(reqBody)) },
+			bytes.Repeat(respUnit, MaxTestCaseSize/len(respUnit)+1), zapcore.ErrorLevel},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			obs, logs := observer.New(zapcore.DebugLevel)
+			logger, out := logleak.Logger(obs)
+			req, err := http.NewRequest(http.MethodPost, target, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Body = c.req()
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(c.resp))}
+			Capture(context.Background(), logger, make(chan *models.TestCase, 1), req, resp, time.Now(), time.Now(), models.IncomingOptions{}, true, false, 8080)
+
+			lines := logs.FilterMessage(c.msg).All()
+			if len(lines) != 1 || lines[0].Level != c.level {
+				t.Fatalf("want the line %q once at %v, got %d: %v", c.msg, c.level, len(lines), logs.All())
+			}
+			fields := lines[0].ContextMap()
+			meta, _ := fields["metadata"].(map[string]string)
+			if meta["method"] != http.MethodPost || meta["path"] != "/pay" || meta["query keys"] != "email,token" {
+				t.Errorf("the line names the request by its method, path and query parameter names; got %v", fields)
+			}
+			if c.msg == "failed to read the http request body" {
+				if fields["bytesRead"] != int64(len(reqBody)) || fields["contentType"] != "application/x-www-form-urlencoded" {
+					t.Errorf("the line gives how much of the body was read and its content type; got %v", fields)
+				}
+			}
+			log := out.String()
+			if !strings.Contains(log, c.msg) {
+				t.Fatalf("the rendered log is not the one checked: %s", log)
+			}
+			for what, content := range planted {
+				if found := logleak.Find(log, content); len(found) > 0 {
+					t.Errorf("the log holds %s: %v", what, found)
+				}
+			}
+		})
 	}
 }

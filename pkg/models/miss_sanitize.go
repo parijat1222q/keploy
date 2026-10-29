@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -89,12 +90,27 @@ func (m UnmatchedCall) SanitizedNextStep() string {
 }
 
 // shapedNextStep is m's own next step with every field path it names in its
-// shape (SanitizedNextStep).
+// shape (SanitizedNextStep), and every sessionCalls path prefix it advises
+// (pathPrefix: "/users/42/orders", the call's own path) in the shape
+// MissShape writes the call's path in: a segment that looks like a value, or
+// that a test variable's place or a field diff names, is {}.
 func (m UnmatchedCall) shapedNextStep() string {
 	text := m.NextSteps
 	if text == "" {
 		return ""
 	}
+	text = pathPrefixRule.ReplaceAllStringFunc(text, func(rule string) string {
+		quoted := pathPrefixRule.FindStringSubmatch(rule)[1]
+		p, err := strconv.Unquote(quoted)
+		if err != nil {
+			return "pathPrefix: " + strconv.Quote(pathHole)
+		}
+		places := append([]string(nil), m.VariablePlaces...)
+		for _, d := range m.FieldDiffs {
+			places = append(places, d.Path)
+		}
+		return "pathPrefix: " + strconv.Quote(holePathPlaces(PathShape(p), places))
+	})
 	var paths []string
 	for _, d := range m.FieldDiffs {
 		for _, p := range []string{d.Path, strings.TrimPrefix(d.Path, "body.")} {
@@ -120,6 +136,10 @@ func (m UnmatchedCall) shapedNextStep() string {
 		return FieldShape(trimmed) + p[len(trimmed):]
 	})
 }
+
+// pathPrefixRule is a sessionCalls rule's path prefix as a next step quotes
+// it (Go-quoted): the HTTP matcher advises the call's own path.
+var pathPrefixRule = regexp.MustCompile(`pathPrefix: ("(?:[^"\\]|\\.)*")`)
 
 // bodyPlace is a body field path as a matcher's or a learn step's text names
 // one (body.cmd.filter.appId, body.docs.msgs.0.q.entity_id, body[0].id): the

@@ -312,6 +312,24 @@ func TestFieldShape(t *testing.T) {
 		{"body.bind.$1", "body.bind.{}"},
 		{"body.literal.7", "body.literal.{}"},
 		{"header.bind.$1", "header.bind.{}"},
+		// A MySQL command's places (its Nth bound parameter, its statement's
+		// Nth inline literal) are positions keploy counts: kept whole, with
+		// or without the body root, so a log or a next step names the field
+		// as the user marks it as noise. Anything else of their look is
+		// shaped as every key is.
+		{"body.parameters.0.value", "body.parameters.0.value"},
+		{"parameters.0.value", "parameters.0.value"},
+		{"body.parameters.12.type", "body.parameters.12.type"},
+		{"body.parameters.65535", "body.parameters.65535"},
+		{"body.query.literals.0", "body.query.literals.0"},
+		{"query.literals.2", "query.literals.2"},
+		{"body.parameters.01.value", "body.parameters.{}.value"},
+		{"body.parameters.123456.value", "body.parameters.{}.value"},
+		{"body.parameters.0.amount", "body.parameters.{}.amount"},
+		{"body.parameters.0.value.id", "body.parameters.{}.value.id"},
+		{"body.data.parameters.42", "body.data.parameters.{}"},
+		{"body.query.literals.7.x", "body.query.literals.{}.x"},
+		{"header.parameters.0", "header.parameters.{}"},
 	}
 	for _, c := range cases {
 		require.Equal(t, c.want, FieldShape(c.in), c.in)
@@ -373,6 +391,22 @@ func TestSQLShapeKeepsNoLiteral(t *testing.T) {
 			}
 		}
 	}
+}
+
+// A statement is read to its bound (maxSQLScan), and one longer is withheld
+// from its first literal on: what lies past the bound could leave a quote
+// unpaired. It was read, and its shape built, whole.
+func TestSQLShapeReadsAStatementToItsBound(t *testing.T) {
+	long := "SELECT a FROM t WHERE x = 'v' AND y IN (" + strings.Repeat("1, ", maxSQLScan) + "2)"
+	require.Equal(t, "SELECT a FROM t WHERE x = ? …", SQLShape(long))
+	require.Equal(t, SQLShape(long), SQLShape(long+" AND z = 'never closed"), "a quote past the bound changes nothing")
+	names := "SELECT " + strings.Repeat("col, ", maxSQLScan) + "x FROM t"
+	got := SQLShape(names)
+	require.True(t, strings.HasSuffix(got, "…") && len(got) <= maxSQLText+len("…"), "a statement with no literal is read to its bound and cut: %q", got)
+	require.True(t, strings.HasPrefix(got, "SELECT col, col,"), got)
+	// The bound falls between the two bytes of é.
+	wide := "SELECT" + strings.Repeat(" ", maxSQLScan-len("SELECT")-1) + "é FROM t"
+	require.Equal(t, "SELECT …", SQLShape(wide))
 }
 
 // Digits inside a kept backtick span are written "?", in case the span was

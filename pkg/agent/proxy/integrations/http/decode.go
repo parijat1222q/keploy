@@ -17,6 +17,7 @@ import (
 
 	"go.keploy.io/server/v3/pkg"
 	"go.keploy.io/server/v3/pkg/agent/proxy/integrations"
+	"go.keploy.io/server/v3/pkg/agent/proxy/integrations/mismatch"
 	pUtil "go.keploy.io/server/v3/pkg/agent/proxy/util"
 	"go.keploy.io/server/v3/pkg/models"
 	"go.keploy.io/server/v3/pkg/provenswitch"
@@ -180,7 +181,7 @@ func (h *HTTP) decodeHTTP(ctx context.Context, reqBuf []byte, clientConn net.Con
 			// query and body never go to the log, only its shape.
 			if ce := h.Logger.Check(zap.DebugLevel, "decodeHTTP debug logs for input"); ce != nil {
 				ce.Write(zap.String("method", input.method),
-					zap.String("path", input.url.Path),
+					zap.String("path", models.PathShape(input.url.EscapedPath())),
 					zap.Strings("header names", headerNames(input.header)),
 					zap.Int("body bytes", len(input.body)))
 			}
@@ -236,7 +237,7 @@ func (h *HTTP) decodeHTTP(ctx context.Context, reqBuf []byte, clientConn net.Con
 				}
 				if ce := h.Logger.Check(zap.DebugLevel, "egress passthrough: serving without mock match"); ce != nil {
 					ce.Write(zap.String("mode", string(mode)), zap.String("served", served),
-						zap.String("path", input.url.Path), zap.Any("metadata", utils.GetReqMeta(request)))
+						zap.Any("metadata", utils.GetReqMeta(request)))
 				}
 				if _, werr := clientConn.Write(out); werr != nil {
 					if ctx.Err() != nil {
@@ -470,15 +471,19 @@ func (h *HTTP) decodeHTTP(ctx context.Context, reqBuf []byte, clientConn net.Con
 					// agnostic mock-mismatch WARN is emitted once in
 					// proxy.sendMockNotFoundError (where every parser's miss
 					// funnels), so this stays Debug to avoid double-logging.
-					h.Logger.Debug("no matching http mock found for outgoing request",
-						zap.String("protocol", report.Protocol),
-						zap.String("destination", report.Destination),
-						zap.String("actual", report.ActualSummary),
-						zap.String("match_phase", report.MatchPhase),
-						zap.Int("candidates", report.CandidateCount),
-						zap.String("closest", report.ClosestMock),
-						zap.String("diff", report.Diff),
-						zap.String("next_step", report.NextSteps))
+					// The call and its diff as a log names them
+					// (mismatch.LogCall, LogDiff): the report keeps the values.
+					// Shaped only when Debug is on: a replay may miss often.
+					if ce := h.Logger.Check(zap.DebugLevel, "no matching http mock found for outgoing request"); ce != nil {
+						ce.Write(zap.String("protocol", report.Protocol),
+							zap.String("destination", report.Destination),
+							zap.String("actual", mismatch.LogCall(report)),
+							zap.String("match_phase", report.MatchPhase),
+							zap.Int("candidates", report.CandidateCount),
+							zap.String("closest", report.ClosestMock),
+							zap.String("diff", mismatch.LogDiff(report)),
+							zap.String("next_step", mismatch.LogNextStep(report)))
+					}
 				}
 
 				// On-miss policy (keploy mock replay --on-miss): passthrough or
@@ -514,7 +519,15 @@ func (h *HTTP) decodeHTTP(ctx context.Context, reqBuf []byte, clientConn net.Con
 				noMockBody := "keploy: no matching mock found for this HTTP request\n"
 				noMock := fmt.Sprintf("HTTP/%d.%d 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
 					request.ProtoMajor, request.ProtoMinor, len(noMockBody), noMockBody)
-				baseErr := fmt.Errorf("%w for %s %s", ErrMockNotMatched, request.Method, request.URL.Path)
+				// Named as a log line names the call (mismatch.LogCall): the
+				// error is logged (at ERROR with the proven switch off), and a
+				// segment may hold a value, one a test variable's place names
+				// though it reads as a name too.
+				call := mismatch.LogCall(report)
+				if call == "" {
+					call = request.Method + " " + models.PathShape(request.URL.EscapedPath())
+				}
+				baseErr := fmt.Errorf("%w for %s", ErrMockNotMatched, call)
 				missErr := models.NewMockMismatchError(baseErr, report)
 				// The miss is queued for the test that made it before the app
 				// sees the 502. The replay reads a test's misses once the app

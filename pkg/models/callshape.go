@@ -162,13 +162,14 @@ func FieldShapes(fields []string) []string {
 // field (header.Authorization). A raw dotted key is shaped part by part
 // (alice.smith@example.com keeps "alice"), so a producer shapes its keys
 // first (KeyShape), as the strict comparison does. An SQL call's place name
-// is kept whole too (sqlPlace: bind.$1, literal.3): a position keploy counts
-// in the statement, not a value the app sent.
+// is kept whole too (sqlPlace: bind.$1, literal.3), as is a MySQL command's
+// (mysqlPlace: body.parameters.0.value, body.query.literals.2): a position
+// keploy counts in the statement, not a value the app sent.
 func FieldShape(f string) string {
 	if name, ok := strings.CutPrefix(f, "header."); ok && name != "" && !strings.Contains(name, ".") {
 		return f
 	}
-	if sqlPlace.MatchString(f) {
+	if sqlPlace.MatchString(f) || mysqlPlace.MatchString(f) {
 		return f
 	}
 	parts := strings.Split(f, ".")
@@ -190,6 +191,17 @@ var fieldIndexes = regexp.MustCompile(`^(\[[0-9]{0,4}\])+$`)
 // parameter, and literal.N, the Nth constant of its text, each counted from
 // 1, up to five digits (a statement binds at most 65535 parameters).
 var sqlPlace = regexp.MustCompile(`^(bind\.\$|literal\.)[1-9][0-9]{0,4}$`)
+
+// mysqlPlace is a whole field that is a MySQL command's place as the MySQL
+// parser's compared body names it: the command's Nth bound parameter
+// (parameters.N, or one of its fields: parameters.N.value) and its
+// statement's Nth inline literal (query.literals.N), each counted from 0, up
+// to five digits (a statement binds at most 65535 parameters), with or
+// without the body root (a user's noise key is written without it). Kept
+// whole, the field reads as the user marks it as noise; the same names under
+// any other root (body.data.parameters.42, an SLD chunk's JSON) are shaped as
+// every key is.
+var mysqlPlace = regexp.MustCompile(`^(body\.)?(parameters\.(0|[1-9][0-9]{0,4})(\.(type|unsigned|name|value))?|query\.literals\.(0|[1-9][0-9]{0,4}))$`)
 
 // KeyShape is an object key, a form key or a query name as a field's name
 // holds it: itself when it reads as a name (PathShape's segment rule), {}
@@ -577,6 +589,11 @@ func isPathNameSeparator(c byte) bool {
 // maxSQLText bounds a statement's shape.
 const maxSQLText = 160
 
+// maxSQLScan bounds how much of a statement SQLShape reads. A shape is at most
+// maxSQLText long, and a statement may run to megabytes (a bulk INSERT, a
+// blob literal) on an Error line written whatever the log level.
+const maxSQLScan = 4096
+
 // SQLShape is a SQL statement with every quoted string and number written
 // "?". It fails closed: what it cannot read for certain is withheld, the rest
 // of the statement written "…": a literal holding a backslash (MySQL reads
@@ -586,8 +603,19 @@ const maxSQLText = 160
 // to a prepared statement's summary) are dropped whole, and a backtick
 // identifier is kept only when it holds no quote. A quoted identifier
 // (Postgres "table") is written "?" too: hiding a name beats keeping a value.
+// A statement is read to maxSQLScan bytes; what lies past them could leave a
+// quote unpaired, so one longer is withheld from its first literal on, as a
+// statement with a literal never closed is.
 func SQLShape(q string) string {
 	if i := strings.Index(q, "params=["); i >= 0 {
+		q = q[:i]
+	}
+	cut := len(q) > maxSQLScan
+	if cut {
+		i := maxSQLScan
+		for i > 0 && !utf8.RuneStart(q[i]) {
+			i--
+		}
 		q = q[:i]
 	}
 	var b strings.Builder
@@ -659,6 +687,15 @@ scan:
 			b.WriteByte(c)
 			i++
 		}
+	}
+	if cut {
+		if firstLiteral >= 0 {
+			s := b.String()[:firstLiteral]
+			b.Reset()
+			b.WriteString(s)
+			b.WriteString("?")
+		}
+		withheld = true
 	}
 	out := strings.TrimSpace(sqlSpace.ReplaceAllString(b.String(), " "))
 	if withheld {

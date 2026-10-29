@@ -8,6 +8,7 @@ import (
 	"io"
 	"iter"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -1172,7 +1173,8 @@ func matchCommandWith(ctx context.Context, logger *zap.Logger, req mysql.Request
 		return out, nil
 	}
 
-	// The whole prepared-statement index, for the debug log only.
+	// The whole prepared-statement index, for the debug log only: each
+	// statement by its shape (models.SQLShape), its literals written "?".
 	if (req.Header.Type == sCOM_STMT_PREP || req.Header.Type == sCOM_STMT_EXEC) && debugOn {
 		if pool == nil {
 			if err := loadPool(); err != nil {
@@ -1182,7 +1184,7 @@ func matchCommandWith(ctx context.Context, logger *zap.Logger, req mysql.Request
 		var allEntries []string
 		for connID, prepEntries := range buildRecordedPrepIndex(pool) {
 			for _, entry := range prepEntries {
-				allEntries = append(allEntries, fmt.Sprintf("connID=%s stmtID=%d query=%q mock=%s", connID, entry.statementID, entry.query, entry.mockName))
+				allEntries = append(allEntries, fmt.Sprintf("connID=%s stmtID=%d query=%q mock=%s", connID, entry.statementID, models.SQLShape(entry.query), entry.mockName))
 			}
 		}
 		logger.Debug("recorded prepEntries", zap.String("entries", strings.Join(allEntries, " | ")))
@@ -1619,7 +1621,7 @@ func matchCommandWith(ctx context.Context, logger *zap.Logger, req mysql.Request
 						actualQuery = liveExec.query
 
 						if debugOn {
-							logger.Debug("queries comparison", zap.String("expected_query", expectedQuery), zap.String("actual_query", actualQuery), zap.Uint32("mock_statement_id", expMsg.StatementID), zap.Uint32("actual_statment_id", actMsg.StatementID), zap.Any("connID", mock.Spec.Metadata["connID"]), zap.String("mock_name", mock.Name))
+							logger.Debug("queries comparison", zap.Stringer("expected_query", sqlShape(expectedQuery)), zap.Stringer("actual_query", sqlShape(actualQuery)), zap.Uint32("mock_statement_id", expMsg.StatementID), zap.Uint32("actual_statment_id", actMsg.StatementID), zap.Any("connID", mock.Spec.Metadata["connID"]), zap.String("mock_name", mock.Name))
 						}
 
 						ev.ok, ev.score, ev.queryExact = matchStmtExecuteLive(logger, mockReq.PacketBundle, req.PacketBundle, expectedQuery, liveExec, liveStatementParams, mock.Name, util.NewNoiseChecker(mock.Noise))
@@ -2035,7 +2037,7 @@ func matchCommandWith(ctx context.Context, logger *zap.Logger, req mysql.Request
 							},
 						},
 					}
-					logger.Debug("Returning synthetic OK for unmocked control/DDL", zap.String("query", q))
+					logger.Debug("Returning synthetic OK for unmocked control/DDL", zap.Stringer("query", sqlShape(q)))
 
 					return generic, true, nil, nil
 				}
@@ -2254,7 +2256,7 @@ func matchCommandWith(ctx context.Context, logger *zap.Logger, req mysql.Request
 				}
 
 				logger.Info("Synthesized PREPARE_OK for unmocked statement (likely TiDB+JDBC cachePrepStmts caching pre-record stmtIDs)",
-					zap.String("query", truncate(strings.TrimSpace(sp.Query), 200)),
+					zap.Stringer("query", sqlShape(sp.Query)),
 					zap.Uint32("synthetic_stmt_id", newStmtID),
 					zap.Uint16("num_params", numParams))
 				return synthetic, true, nil, nil
@@ -2271,14 +2273,14 @@ func matchCommandWith(ctx context.Context, logger *zap.Logger, req mysql.Request
 			logger.Debug("mock miss",
 				zap.String("protocol", "MySQL"),
 				zap.String("type", req.Header.Type),
-				zap.String("actual_query", truncate(actualQuery, 200)),
+				zap.Stringer("actual_query", sqlShape(actualQuery)),
 				zap.String("closest_mock", bestPartialMock.Name),
-				zap.String("closest_query", truncate(bestPartialQuery, 200)))
+				zap.Stringer("closest_query", sqlShape(bestPartialQuery)))
 		} else if actualQuery != "" {
 			logger.Debug("mock miss",
 				zap.String("protocol", "MySQL"),
 				zap.String("type", req.Header.Type),
-				zap.String("actual_query", truncate(actualQuery, 200)))
+				zap.Stringer("actual_query", sqlShape(actualQuery)))
 		}
 
 		bestPartialMockName := ""
@@ -2353,7 +2355,7 @@ func matchCommandWith(ctx context.Context, logger *zap.Logger, req mysql.Request
 			logger.Debug("schema-noise detection: learned request-body drift on matched mock",
 				zap.String("mock", matchedMock.Name),
 				zap.String("request_type", req.Header.Type),
-				zap.Strings("fields", paths))
+				zap.Strings("fields", models.FieldShapes(paths)))
 		}
 	}
 
@@ -2400,7 +2402,7 @@ func matchCommandWith(ctx context.Context, logger *zap.Logger, req mysql.Request
 					logger.Debug("Recorded runtime PREP mapping with new statement ID",
 						zap.Uint32("original_stmt_id from mock ", originalStmtID),
 						zap.Uint32("new_stmt_id", prepareOkRespCopy.StatementID),
-						zap.String("query", strings.TrimSpace(sp.Query)))
+						zap.Stringer("query", sqlShape(sp.Query)))
 				}
 			}
 		}
@@ -2432,6 +2434,21 @@ func matchCommandWith(ctx context.Context, logger *zap.Logger, req mysql.Request
 // 	return matchCount
 // }
 
+// parseFailure is a statement's parse error as keploy keeps it: where the
+// parser stopped, never the parser's text. The parser quotes the token it
+// stopped near ("syntax error at position 52 near 'ada@example.com'"), and
+// that token is the statement's own text: a literal the application sent.
+// Its caller logs the error beside the statement's shape (sqlShape).
+func parseFailure(err error) error {
+	if m := parsePosition.FindStringSubmatch(err.Error()); m != nil {
+		return fmt.Errorf("failed to parse SQL: the parser stopped at byte %s", m[1])
+	}
+	return errors.New("failed to parse SQL")
+}
+
+// parsePosition is where a vitess parse error says the parser stopped.
+var parsePosition = regexp.MustCompile(`\bat position (\d+)`)
+
 func getQueryStructure(sql string) (string, error) {
 
 	opts := sqlparser.Options{}
@@ -2442,7 +2459,7 @@ func getQueryStructure(sql string) (string, error) {
 
 	stmt, err := parser.Parse(sql)
 	if err != nil {
-		return "", fmt.Errorf("failed to parse SQL: %w", err)
+		return "", parseFailure(err)
 	}
 
 	var structureParts []string
@@ -2554,8 +2571,8 @@ func matchQueryLive(log *zap.Logger, expected, actual mysql.PacketBundle, live *
 	actualPlaceholders := live.placeholders
 	if expectedPlaceholders != actualPlaceholders {
 		// log.Debug("placeholder count mismatch",
-		// 	zap.String("expected_query", expectedQuery),
-		// 	zap.String("actual_query", actualQuery),
+		// 	zap.Stringer("expected_query", sqlShape(expectedQuery)),
+		// 	zap.Stringer("actual_query", sqlShape(actualQuery)),
 		// 	zap.Int("expected_placeholders", expectedPlaceholders),
 		// 	zap.Int("actual_placeholders", actualPlaceholders))
 		return false, 0, expectedQuery
@@ -2566,7 +2583,7 @@ func matchQueryLive(log *zap.Logger, expected, actual mysql.PacketBundle, live *
 	// rejects the very statements this comparison exists to match.
 	if expectedQuery == actualQuery {
 		if ce := log.Check(zap.DebugLevel, "Query Exact matched"); ce != nil {
-			ce.Write(zap.String("expected query", expectedQuery), zap.String("actual query", actualQuery))
+			ce.Write(zap.Stringer("expected query", sqlShape(expectedQuery)), zap.Stringer("actual query", sqlShape(actualQuery)))
 		}
 		return true, scoreQueryExact, expectedQuery
 	}
@@ -2633,13 +2650,13 @@ func matchQueryLive(log *zap.Logger, expected, actual mysql.PacketBundle, live *
 	// check if any of them the query is dml and other is not, then there is no match.
 	if expectedIsDML && !actualIsDML {
 		log.Debug("expected query is dml but actual is not",
-			zap.String("expected query", expectedQuery),
-			zap.String("actual query", actualQuery))
+			zap.Stringer("expected query", sqlShape(expectedQuery)),
+			zap.Stringer("actual query", sqlShape(actualQuery)))
 		return false, 0, expectedQuery
 	} else if !expectedIsDML && actualIsDML {
 		log.Debug("actual query is dml but expected is not",
-			zap.String("expected query", expectedQuery),
-			zap.String("actual query", actualQuery))
+			zap.Stringer("expected query", sqlShape(expectedQuery)),
+			zap.Stringer("actual query", sqlShape(actualQuery)))
 		return false, 0, expectedQuery
 	}
 
@@ -2656,15 +2673,15 @@ func matchQueryLive(log *zap.Logger, expected, actual mysql.PacketBundle, live *
 		if !isSessionControlStatement(expectedQuery) && !isSessionControlStatement(actualQuery) &&
 			maskSQLLiterals(expectedQuery) == live.maskedLiterals() {
 			log.Debug("query matched with drifted inline literals",
-				zap.String("expected query", expectedQuery),
-				zap.String("actual query", actualQuery))
+				zap.Stringer("expected query", sqlShape(expectedQuery)),
+				zap.Stringer("actual query", sqlShape(actualQuery)))
 			// The payload-length tie-break only ranks candidates already known to
 			// share every keyword, identifier and literal type.
 			return false, scoreQueryLiteralDrift + equalPayloadLength(expected, actual), expectedQuery
 		}
 		log.Debug("No Query is dml",
-			zap.String("expected query", expectedQuery),
-			zap.String("actual query", actualQuery))
+			zap.Stringer("expected query", sqlShape(expectedQuery)),
+			zap.Stringer("actual query", sqlShape(actualQuery)))
 		return false, 0, expectedQuery
 	}
 
@@ -2675,7 +2692,7 @@ func matchQueryLive(log *zap.Logger, expected, actual mysql.PacketBundle, live *
 	actualSignature, err := live.structure()
 	if err != nil {
 		log.Debug("failed to get actual query structure",
-			zap.String("actual Query", actualQuery),
+			zap.Stringer("actual Query", sqlShape(actualQuery)),
 			zap.Error(err))
 		return false, 0, expectedQuery
 	}
@@ -2683,7 +2700,7 @@ func matchQueryLive(log *zap.Logger, expected, actual mysql.PacketBundle, live *
 	expectedSignature, err := getQueryStructureCached(expectedQuery)
 	if err != nil {
 		log.Debug("failed to get expected query structure",
-			zap.String("expected Query", expectedQuery),
+			zap.Stringer("expected Query", sqlShape(expectedQuery)),
 			zap.Error(err))
 		return false, 0, expectedQuery
 	}
@@ -2718,24 +2735,35 @@ func preparePacketText(packet mysql.PacketBundle) string {
 // miss's field diffs (maskAttributeDiffs).
 const maskedAttributeValue = "[masked]"
 
-// executeForLog is a COM_STMT_EXECUTE as the debug log shows it: its query
-// attributes' values (its parameters sent with a name; a statement's own are
-// sent unnamed) masked. The client names an attribute (a password, a
-// tenant's token), and what redacts a log goes by what a value looks like,
-// not by such a name: one only its name says is a secret was logged in the
-// clear.
+// executeForLog is a COM_STMT_EXECUTE as the debug log shows it: every
+// parameter's value masked, its names and types kept. A statement's own
+// values are the app's data (an e-mail address, a name), and a query
+// attribute's (a parameter sent with a name: a password, a tenant's token)
+// is a secret whatever it looks like. A debug log leaves the machine (an
+// issue, a support bundle, a collector), so it says what was sent, never
+// what it held.
 func executeForLog(p *mysql.StmtExecutePacket) *mysql.StmtExecutePacket {
 	if p == nil {
 		return nil
 	}
 	c := *p
-	c.Parameters = slices.Clone(p.Parameters)
-	for i := range c.Parameters {
-		if c.Parameters[i].Name != "" && c.Parameters[i].Value != nil {
-			c.Parameters[i].Value = maskedAttributeValue
+	c.Parameters = maskedParameters(p.Parameters)
+	// zap's JSON rendering leaves LegacyParameters out (json:"-"), but a
+	// logger's other encoders, and an observed entry printed with %+v, do
+	// not: the copy holds no value anywhere.
+	c.LegacyParameters = maskedParameters(p.LegacyParameters)
+	return &c
+}
+
+// maskedParameters is a copy of params with every value masked.
+func maskedParameters(params []mysql.Parameter) []mysql.Parameter {
+	c := slices.Clone(params)
+	for i := range c {
+		if c[i].Value != nil {
+			c[i].Value = maskedAttributeValue
 		}
 	}
-	return &c
+	return c
 }
 
 // typesSentByBoth reports whether both COM_STMT_EXECUTEs carry their
@@ -3134,7 +3162,7 @@ func matchStmtExecuteLive(logger *zap.Logger, expected, actual mysql.PacketBundl
 
 	if allParamsMatched && eq == "" {
 		if ce := logger.Check(zap.DebugLevel, "EXECUTE matched on params alone (mock has no recorded PREPARE)"); ce != nil {
-			ce.Write(zap.String("mock-name", mockName), zap.String("actual_query", truncate(aq, 200)))
+			ce.Write(zap.String("mock-name", mockName), zap.Stringer("actual_query", sqlShape(aq)))
 		}
 		return true, matchCount, queryExactMatched
 	}
@@ -4208,7 +4236,7 @@ func buildSessionVarResponse(logger *zap.Logger, pool []*models.Mock, varName st
 	}
 	if logger != nil {
 		logger.Debug("built single-column session-variable result set",
-			zap.String("var", varName), zap.Any("value", val.Value))
+			zap.String("var", varName), zap.String("value type", fmt.Sprintf("%T", val.Value))) // the value is the recording's
 	}
 	return &mysql.Response{
 		PacketBundle: mysql.PacketBundle{
@@ -4221,3 +4249,12 @@ func buildSessionVarResponse(logger *zap.Logger, pool []*models.Mock, varName st
 		},
 	}
 }
+
+// sqlShape is a statement as a log line shows it: its shape, its literals
+// written "?" (models.SQLShape), which models.SQLShape bounds. A literal is
+// the app's data (an e-mail address in a WHERE). The shape is computed only
+// when the line is written, so a matcher comparing many candidates pays
+// nothing with Debug off.
+type sqlShape string
+
+func (q sqlShape) String() string { return models.SQLShape(string(q)) }

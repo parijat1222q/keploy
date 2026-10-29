@@ -11,9 +11,13 @@ import (
 	"testing"
 	"time"
 
+	"go.keploy.io/server/v3/pkg/agent/logleak"
+	"go.keploy.io/server/v3/pkg/agent/proxy/integrations/mismatch"
 	"go.keploy.io/server/v3/pkg/agent/proxy/integrations/util"
 	"go.keploy.io/server/v3/pkg/models"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // mockMemDb is a minimal mock of the MockMemDb interface for testing.
@@ -1134,6 +1138,108 @@ func TestQueryParamsMatch_ValueSensitive(t *testing.T) {
 			if got != tc.want {
 				t.Fatalf("QueryParamsMatch(%v, %v, %v) = %v, want %v",
 					tc.mockParams, tc.reqQuery, tc.urlNoise, got, tc.want)
+			}
+		})
+	}
+}
+
+// The session-call hint advises the call's own path as its prefix. It cut
+// the path before its first segment that may hold a value, ending in "/":
+// "/tenants/" served /tenants/acct_Y/billing too, so a test that should miss
+// another tenant's call passed. Before that it advised no prefix at all for a
+// path that starts with a value, a rule that serves every such call.
+func TestSessionCallHint_AdvisesTheCallsOwnPath(t *testing.T) {
+	for _, path := range []string{"/oauth/token", "/tenants/acct_9Lq2Zx7WbN4/config", "/acct_9Lq2Zx7WbN4/token", "/users/grace.vault@example.net/keys"} {
+		req := &http.Request{Method: "POST", Host: "auth.example.com", URL: &url.URL{Path: path}}
+		want := fmt.Sprintf(`sessionCalls: [{host: "auth.example.com", method: "POST", pathPrefix: %q}]`, path)
+		if got := sessionCallHint(req); !strings.Contains(got, want) {
+			t.Errorf("%s: hint %q does not advise %s", path, got, want)
+		}
+	}
+}
+
+// A call to "/" gets no sessionCalls rule: a pathPrefix "/" covers every
+// path, so the rule would serve every call of the method to the host to
+// every test. It advised pathPrefix "/".
+func TestSessionCallHint_AdvisesNoRuleForTheRootPath(t *testing.T) {
+	for _, u := range []*url.URL{{Path: "/"}, {}, nil} {
+		req := &http.Request{Method: "POST", Host: "auth.example.com", URL: u}
+		got := sessionCallHint(req)
+		if strings.Contains(got, "sessionCalls: [") || strings.Contains(got, "pathPrefix: \"") {
+			t.Errorf("%v: the hint advises a rule for every path: %q", u, got)
+		}
+		if !strings.Contains(got, mismatch.RecordCommand()) || !strings.Contains(got, "every POST call to auth.example.com") {
+			t.Errorf("%v: the hint does not say why no rule is safe and advise recording again: %q", u, got)
+		}
+	}
+}
+
+// The hint's path prefix is the call's own path, which the report keeps; a
+// log line (mismatch.LogNextStep, at WARN and Debug) and a proven run's
+// evidence (UnmatchedCall.Sanitized) write it in the call's shape: a segment
+// that looks like a value, or that a test variable's place names, is {}.
+func TestLogNextStep_WritesTheHintsPathPrefixByItsShape(t *testing.T) {
+	for _, c := range []struct {
+		path, want string
+		places     []string
+		values     []string
+	}{
+		{"/tenants/acct_9Lq2Zx7WbN4/config", "/tenants/{}/config", nil, []string{"acct_9Lq2Zx7WbN4"}},
+		{"/users/grace.vault@example.net/keys", "/users/{}/keys", nil, []string{"grace.vault", "example.net"}},
+		{"/users/gracevault/orders", "/users/{}/orders", []string{"url.path[1]"}, []string{"gracevault"}},
+	} {
+		req := &http.Request{Method: "GET", Host: "api.example.com", URL: &url.URL{Path: c.path}}
+		r := &models.MockMismatchReport{Protocol: "HTTP", NextSteps: "No mock matched. " + sessionCallHint(req), VariablePlaces: c.places}
+		want := fmt.Sprintf("pathPrefix: %q", c.want)
+		evidence := models.UnmatchedCall{Protocol: "HTTP", NextSteps: r.NextSteps, VariablePlaces: c.places}.Sanitized().NextSteps
+		for form, got := range map[string]string{"log": mismatch.LogNextStep(r), "evidence": evidence} {
+			if !strings.Contains(got, want) {
+				t.Errorf("%s: the %s next step %q does not name %s", c.path, form, got, want)
+			}
+			for _, v := range c.values {
+				if strings.Contains(got, v) {
+					t.Errorf("%s: the %s next step %q holds the path's value %q", c.path, form, got, v)
+				}
+			}
+		}
+		if !strings.Contains(r.NextSteps, fmt.Sprintf("pathPrefix: %q", c.path)) {
+			t.Errorf("%s: the report's next step %q lost the call's path", c.path, r.NextSteps)
+		}
+	}
+}
+
+// A query value treated as auto-detected dynamic is logged by its param's
+// name as a field holds it (models.KeyShape): a name that reads as one is
+// kept (id), one that may be a value the app sent (an e-mail address used as
+// the key) is {}, and no stretch of the key or of either side's value
+// appears in the log in any encoding. The key was logged as it was.
+func TestQueryParamsMatch_AnAutoDynamicValueIsLoggedByItsKeysShape(t *testing.T) {
+	const key = "gracevault@example.net"
+	const recorded, live = "3f2504e0-4f89-11d3-9a0c-0305e82c3301", "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+	const line = "http query: value treated as auto-detected dynamic"
+	for _, c := range []struct{ key, want string }{{key, "{}"}, {"id", "id"}} {
+		t.Run(c.want, func(t *testing.T) {
+			obs, logs := observer.New(zapcore.DebugLevel)
+			logger, out := logleak.Logger(obs)
+			h := &HTTP{Logger: logger}
+			if !h.QueryParamsMatch(map[string]string{c.key: recorded}, url.Values{c.key: {live}}, nil, true) {
+				t.Fatal("precondition: a uuid that drifted to another uuid did not match as auto-detected dynamic")
+			}
+			lines := logs.FilterMessage(line).All()
+			if len(lines) == 0 {
+				t.Fatalf("the line %q was not logged; got %v", line, logs.All())
+			}
+			if got := lines[0].ContextMap()["param"]; got != c.want {
+				t.Errorf("param = %v, want %q", got, c.want)
+			}
+			log := out.String()
+			if !strings.Contains(log, line) {
+				t.Fatalf("the rendered log is not the one checked: %s", log)
+			}
+			for what, content := range map[string]string{"the key": key, "the recorded value": recorded, "the live value": live} {
+				if found := logleak.Find(log, []byte(content)); len(found) > 0 {
+					t.Errorf("the log holds %s: %v", what, found)
+				}
 			}
 		})
 	}

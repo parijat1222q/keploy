@@ -279,7 +279,7 @@ func (h *HTTP) parseFinalHTTP(ctx context.Context, mock *FinalHTTP, destPort uin
 			}
 		}
 
-		h.Logger.Debug("This is the response body: " + string(respBody))
+		h.Logger.Debug("read the response body", zap.Int("bytes", len(respBody)))
 		//Set the content length to the headers, except on a response with no
 		//body by rule (to a HEAD, a 1xx, 204 or 304), which keeps its own (as
 		//buildHTTPMock does).

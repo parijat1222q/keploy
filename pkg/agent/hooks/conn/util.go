@@ -3,7 +3,6 @@ package conn
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -139,7 +138,9 @@ func Capture(ctx context.Context, logger *zap.Logger, t chan *models.TestCase, r
 		var err error
 		reqBody, err = io.ReadAll(req.Body)
 		if err != nil {
-			logger.Debug("failed to read the http request body", zap.Any("metadata", utils.GetReqMeta(req)), zap.Int64("of size", int64(len(reqBody))), zap.String("body", base64.StdEncoding.EncodeToString(reqBody)), zap.Error(err))
+			// The body is the app's content: the line says how much of it was
+			// read and what kind it is, never what it holds.
+			logger.Debug("failed to read the http request body", zap.Any("metadata", utils.GetReqMeta(req)), zap.Int("bytesRead", len(reqBody)), zap.String("contentType", req.Header.Get("Content-Type")), zap.Error(err))
 		}
 
 		if req.Header.Get("Content-Encoding") != "" {
@@ -150,8 +151,7 @@ func Capture(ctx context.Context, logger *zap.Logger, t chan *models.TestCase, r
 					// decompression MaxTestCaseSize check further down, hit
 					// earlier — log it the same way, not as a decode failure.
 					logger.Error("HTTP test case data exceeds 5MB limit, skipping capture",
-						zap.String("url", req.URL.String()),
-						zap.String("method", req.Method))
+						zap.Any("metadata", utils.GetReqMeta(req)))
 					return
 				}
 				utils.LogError(logger, err, "failed to decode the http request body", zap.Any("metadata", utils.GetReqMeta(req)))
@@ -201,8 +201,7 @@ func Capture(ctx context.Context, logger *zap.Logger, t chan *models.TestCase, r
 		if err != nil {
 			if errors.Is(err, pkg.ErrDecompressedTooLarge) {
 				logger.Error("HTTP test case data exceeds 5MB limit, skipping capture",
-					zap.String("url", req.URL.String()),
-					zap.String("method", req.Method))
+					zap.Any("metadata", utils.GetReqMeta(req)))
 				return
 			}
 			utils.LogError(logger, err, "failed to decompress the response body")
@@ -217,8 +216,7 @@ func Capture(ctx context.Context, logger *zap.Logger, t chan *models.TestCase, r
 			zap.Int("totalSize", totalSize),
 			zap.Int("reqBodySize", len(reqBody)),
 			zap.Int("respBodySize", len(respBody)),
-			zap.String("url", req.URL.String()),
-			zap.String("method", req.Method))
+			zap.Any("metadata", utils.GetReqMeta(req)))
 		return
 	}
 
@@ -230,8 +228,7 @@ func Capture(ctx context.Context, logger *zap.Logger, t chan *models.TestCase, r
 		respBodySize = int64(len(respBody))
 		logger.Debug("response body exceeds 1MB during recording, storing only body size",
 			zap.Int64("body_size_bytes", respBodySize),
-			zap.String("url", req.URL.String()),
-			zap.String("method", req.Method))
+			zap.Any("metadata", utils.GetReqMeta(req)))
 		respBody = []byte{} // clear the body — only size is stored
 	}
 
@@ -660,7 +657,7 @@ func CaptureGRPC(ctx context.Context, logger *zap.Logger, t chan *models.TestCas
 	if totalSize > MaxTestCaseSize {
 		logger.Error("gRPC test case data exceeds 5MB limit, skipping capture",
 			zap.Int("totalSize", totalSize),
-			zap.String("path", http2Stream.GRPCReq.Headers.PseudoHeaders[":path"]))
+			zap.String("method", grpcMethod(http2Stream)))
 		return
 	}
 
@@ -684,6 +681,15 @@ func CaptureGRPC(ctx context.Context, logger *zap.Logger, t chan *models.TestCas
 		return
 	case t <- testCase:
 		logger.Debug("Captured gRPC test case",
-			zap.String("path", http2Stream.GRPCReq.Headers.PseudoHeaders[":path"]))
+			zap.String("method", grpcMethod(http2Stream)))
 	}
+}
+
+// grpcMethod is a gRPC call's :path, its /package.Service/Method. A gRPC
+// path carries no query, so it names the call and holds none of its content.
+func grpcMethod(s *pkg.HTTP2Stream) string {
+	if s == nil || s.GRPCReq == nil {
+		return ""
+	}
+	return s.GRPCReq.Headers.PseudoHeaders[":path"]
 }

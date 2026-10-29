@@ -36,6 +36,7 @@ import (
 	"go.keploy.io/server/v3/pkg/agent/proxy/cbshim"
 	"go.keploy.io/server/v3/pkg/agent/proxy/integrations"
 	"go.keploy.io/server/v3/pkg/agent/proxy/integrations/async"
+	"go.keploy.io/server/v3/pkg/agent/proxy/integrations/mismatch"
 	"go.keploy.io/server/v3/pkg/agent/proxy/relay"
 	syncMock "go.keploy.io/server/v3/pkg/agent/proxy/syncMock"
 	pTls "go.keploy.io/server/v3/pkg/agent/proxy/tls"
@@ -5558,7 +5559,10 @@ func (p *Proxy) sayLearnWaits() {
 	})
 }
 
-// missSummaries names, for a log line, the calls of up to the first 10 misses.
+// missSummaries names, for a log line, the calls of up to the first 10
+// misses, as a log names a call (mismatch.LogCall): a call by its shape, or
+// by its protocol where its shape could hold a key or a document. A miss with
+// no report is named by its kind: its error's text may quote the call.
 func missSummaries(errs []error) []string {
 	out := make([]string, 0, min(len(errs), 10))
 	for _, err := range errs {
@@ -5566,11 +5570,18 @@ func missSummaries(errs []error) []string {
 			break
 		}
 		var pe models.ParserError
-		if errors.As(err, &pe) && pe.MismatchReport != nil && pe.MismatchReport.ActualSummary != "" {
-			out = append(out, pe.MismatchReport.ActualSummary)
-			continue
+		switch {
+		case errors.As(err, &pe) && pe.MismatchReport != nil:
+			if call := mismatch.LogCall(pe.MismatchReport); call != "" {
+				out = append(out, call)
+			} else {
+				out = append(out, "a "+pe.MismatchReport.Protocol+" call")
+			}
+		case errors.As(err, &pe) && pe.ParserErrorType != "":
+			out = append(out, "a miss with no report ("+string(pe.ParserErrorType)+")")
+		default:
+			out = append(out, "a miss with no report")
 		}
-		out = append(out, err.Error())
 	}
 	return out
 }
@@ -6043,12 +6054,20 @@ func (p *Proxy) sendMockNotFoundErrorFrom(err error, pid uint32, dst *models.Con
 		fields := []zap.Field{
 			zap.String("protocol", r.Protocol),
 			zap.String("destination", r.Destination),
-			zap.String("actual", r.ActualSummary),
+		}
+		// The call as a log names it (mismatch.LogCall): a URL's or a
+		// statement's values are the app's content, and this line is logged
+		// at WARN. The report file keeps the full summary. A call keploy has
+		// no shape for is left out, not logged empty.
+		if call := mismatch.LogCall(r); call != "" {
+			fields = append(fields, zap.String("actual", call))
+		}
+		fields = append(fields,
 			zap.String("match_phase", r.MatchPhase),
 			zap.Int("candidates", r.CandidateCount),
 			zap.String("closest", r.ClosestMock),
-			zap.String("next_step", r.NextSteps),
-		}
+			zap.String("next_step", mismatch.LogNextStep(r)),
+		)
 		// destination_scope is greppable in a node-wide agent log:
 		// "not_in_compared_set" is the one value that says "nothing this miss
 		// was compared against even targets that upstream" — in Kubernetes

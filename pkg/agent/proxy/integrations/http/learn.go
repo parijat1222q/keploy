@@ -1713,7 +1713,7 @@ func (h *HTTP) learnMatchIn(ctx context.Context, input *req, mockDb integrations
 			}
 			for _, l := range learned {
 				h.Logger.Info("learned a field that changed between record and replay",
-					zap.String("mock", m.Name), zap.String("field", l.Recorded.Path), zap.String("as", string(l.Kind)))
+					zap.String("mock", m.Name), zap.String("field", models.FieldShape(l.Recorded.Path)), zap.String("as", string(l.Kind)))
 			}
 			if e, ok := n.servedExchange(m, answered, c.Shape, recordedParts(m), liveShape, live, out, own); ok {
 				tracker.Served(test, e)
